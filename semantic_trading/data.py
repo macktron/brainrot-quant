@@ -16,6 +16,7 @@ from semantic_trading.config import (
     DATA_DIR,
     GAMMA_API_BASE,
     MIN_MARKET_DURATION_DAYS,
+    SPORTS_EXCLUDE_PATTERNS,
 )
 from semantic_trading.types import PricePoint, ResolvedMarket
 
@@ -48,6 +49,12 @@ def _fetch_gamma_markets(
         return resp.json()
 
 
+def _is_sports_market(question: str) -> bool:
+    """Detect sports/game markets that have independent outcomes."""
+    q = question.lower()
+    return any(pat.lower() in q for pat in SPORTS_EXCLUDE_PATTERNS)
+
+
 def fetch_resolved_markets(
     *,
     max_markets: int = 1000,
@@ -55,6 +62,7 @@ def fetch_resolved_markets(
     start_after: Optional[datetime] = None,
     end_before: Optional[datetime] = None,
     month_keyword: Optional[str] = None,
+    exclude_sports: bool = True,
 ) -> list[ResolvedMarket]:
     """
     Fetch resolved binary markets from Polymarket Gamma API.
@@ -62,9 +70,10 @@ def fetch_resolved_markets(
     Applies the paper's filters:
     - Binary outcomes only (exactly 2 tokens)
     - Duration > MIN_MARKET_DURATION_DAYS
+    - Optional: exclude sports/game markets (independent outcomes)
     - Optional month keyword filter (e.g. "April" in question text)
     """
-    cache_key = f"resolved_{max_markets}_{month_keyword or 'all'}"
+    cache_key = f"resolved_{max_markets}_{month_keyword or 'all'}{'_nosports' if exclude_sports else ''}"
     cache_path = DATA_DIR / f"{cache_key}.json"
     if cache_path.exists():
         logger.info("Loading cached markets from %s", cache_path)
@@ -103,6 +112,8 @@ def fetch_resolved_markets(
             if end_before and m.market_start_time > end_before:
                 continue
             if month_keyword and month_keyword.lower() not in m.question.lower():
+                continue
+            if exclude_sports and _is_sports_market(m.question):
                 continue
 
             markets.append(m)

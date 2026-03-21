@@ -13,12 +13,13 @@ For live/forward-testing, real tick data is used.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+import re
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import numpy as np
 
-from semantic_trading.config import ENTRY_PRICE_CUTOFF, TERMINAL_PRICE_CUTOFF
+from semantic_trading.config import ENTRY_PRICE_CUTOFF, MAX_PAIR_GAP_DAYS, TERMINAL_PRICE_CUTOFF
 from semantic_trading.data import (
     fetch_price_history,
     get_price_at_or_after,
@@ -37,9 +38,28 @@ logger = logging.getLogger(__name__)
 
 def _normalize_question(q: str) -> str:
     """Strip date suffixes and normalize whitespace for matching."""
-    import re
     q = re.sub(r'\s*\(start:.*$', '', q)
     return q.strip().lower()
+
+
+_POINT_DATE = re.compile(r'on\s+(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}', re.I)
+_RANGE_MONTH = re.compile(r'in\s+(january|february|march|april|may|june|july|august|september|october|november|december)\b', re.I)
+_PRICE_PATTERN = re.compile(r'\$[\d,.]+')
+
+
+def _is_date_resolution_mismatch(q1: str, q2: str) -> bool:
+    """Detect point-in-time vs any-time-in-period pairs for price markets."""
+    q1_has_price = bool(_PRICE_PATTERN.search(q1))
+    q2_has_price = bool(_PRICE_PATTERN.search(q2))
+    if not (q1_has_price and q2_has_price):
+        return False
+
+    q1_point = bool(_POINT_DATE.search(q1))
+    q2_point = bool(_POINT_DATE.search(q2))
+    q1_range = bool(_RANGE_MONTH.search(q1))
+    q2_range = bool(_RANGE_MONTH.search(q2))
+
+    return (q1_point and q2_range) or (q2_point and q1_range)
 
 
 def _resolve_market_by_question(
@@ -91,6 +111,10 @@ def evaluate_relation(
     2. Estimate entry price from follower's lastTradePrice or use 0.5 default.
     3. Compute P&L under unit-stake binary payoff.
     """
+    if _is_date_resolution_mismatch(relation.question_i, relation.question_j):
+        logger.debug("Skipping trade: date resolution mismatch (point vs range)")
+        return None
+
     market_i = _resolve_market_by_question(relation.question_i, markets)
     market_j = _resolve_market_by_question(relation.question_j, markets)
 
@@ -100,6 +124,14 @@ def evaluate_relation(
         return None
 
     if not market_i.outcome or not market_j.outcome:
+        return None
+
+    # Temporal proximity filter: skip pairs with end dates too far apart
+    end_i = _ensure_aware(market_i.market_end_time)
+    end_j = _ensure_aware(market_j.market_end_time)
+    gap = abs((end_i - end_j).days)
+    if gap > MAX_PAIR_GAP_DAYS:
+        logger.debug("Skipping trade: market end dates %d days apart (max %d)", gap, MAX_PAIR_GAP_DAYS)
         return None
 
     leader, follower = _determine_leader_follower(market_i, market_j)

@@ -34,7 +34,18 @@ CLUSTER_CATEGORIES = [
     "other",
 ]
 
-CONFIDENCE_THRESHOLD = 0.5
+CONFIDENCE_THRESHOLD = 0.80
 ENTRY_PRICE_CUTOFF = 0.1
 TERMINAL_PRICE_CUTOFF = 0.1
 MIN_MARKET_DURATION_DAYS = 7
+MAX_PAIR_GAP_DAYS = 90
+ONLY_SAME_OUTCOME = True
+
+# Sports/game patterns to filter out -- these are independent events with no causal link
+SPORTS_EXCLUDE_PATTERNS = [
+    "win on 202", "fastest lap", "pole position", "Grand Prix",
+    "T20 ", "BPL:", "CSA ", "Toss Match", "Both Teams to Score",
+    "end in a draw", "Anytime Goalscorer", "Most kills",
+    "Serie A", "Bundesliga", "LaLiga", " vs ",
+    "Match O/U", "Completed match",
+]
