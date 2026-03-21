@@ -42,7 +42,7 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           # Scheduled = LIVE, manual trigger = PAPER
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && 'true' || 'false' }}
-        run: python run_live.py --max-markets 300
+        run: python run_live.py --max-markets 2000
 
       - name: Commit run history
         if: always()

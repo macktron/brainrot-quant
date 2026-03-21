@@ -16,7 +16,8 @@ logger = logging.getLogger(__name__)
 
 HISTORY_DIR = Path(__file__).resolve().parent.parent / "history"
 HISTORY_DIR.mkdir(exist_ok=True)
-RUNS_FILE = HISTORY_DIR / "runs.jsonl"
+LIVE_FILE = HISTORY_DIR / "runs_live.jsonl"
+PAPER_FILE = HISTORY_DIR / "runs_paper.jsonl"
 
 
 def record_trade(
@@ -90,8 +91,9 @@ def save_run(
         "trades": trades,
     }
 
-    with open(RUNS_FILE, "a") as f:
+    target = LIVE_FILE if mode == "live" else PAPER_FILE
+    with open(target, "a") as f:
         f.write(json.dumps(record, default=str) + "\n")
 
-    logger.info("Run record saved to %s (%d trades)", RUNS_FILE, len(trades))
-    return RUNS_FILE
+    logger.info("Run record saved to %s (%d trades)", target, len(trades))
+    return target

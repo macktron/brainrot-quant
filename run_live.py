@@ -357,7 +357,7 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="Semantic Trading — Daily Pipeline")
-    parser.add_argument("--max-markets", type=int, default=300)
+    parser.add_argument("--max-markets", type=int, default=2000)
     parser.add_argument("--live", action="store_true", help="Force live trading")
     parser.add_argument("--paper", action="store_true", help="Force paper trading")
     args = parser.parse_args()
