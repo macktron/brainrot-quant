@@ -8,6 +8,9 @@ on:
   workflow_dispatch:
     # Manual trigger is ALWAYS paper trading (for testing)
 
+permissions:
+  contents: write
+
 jobs:
   trade:
     runs-on: ubuntu-latest
@@ -40,3 +43,13 @@ jobs:
           # Scheduled = LIVE, manual trigger = PAPER
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && 'true' || 'false' }}
         run: python run_live.py --max-markets 300
+
+      - name: Commit run history
+        if: always()
+        run: |
+          git config user.name "semantic-trader[bot]"
+          git config user.email "bot@semantic-trader"
+          git pull --rebase origin main || true
+          git add history/
+          git diff --cached --quiet || git commit -m "run: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push || true

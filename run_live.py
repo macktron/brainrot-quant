@@ -44,6 +44,7 @@ from semantic_trading.execute import (
     execute_trade,
     fetch_balance,
 )
+from semantic_trading.history import record_trade, save_run
 from semantic_trading.labeling import label_all_clusters
 from semantic_trading.notify import (
     send_balance_alert,
@@ -179,6 +180,13 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
 
     if len(deduped) < 5:
         logger.error("Too few markets (%d). Exiting.", len(deduped))
+        save_run(
+            mode="live" if not dry_run else "paper",
+            balance_before=balance.balance_usdc if not dry_run else None,
+            balance_after=balance.balance_usdc if not dry_run else None,
+            markets_scanned=len(deduped), clusters=0,
+            relations_discovered=0, trades=[],
+        )
         send_summary_notification(
             markets_fetched=len(deduped), relations_discovered=0,
             trades_executed=0, trades_failed=0,
@@ -196,6 +204,13 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
 
     if not relations:
         logger.info("No relations discovered. Exiting.")
+        save_run(
+            mode="live" if not dry_run else "paper",
+            balance_before=balance.balance_usdc if not dry_run else None,
+            balance_after=balance.balance_usdc if not dry_run else None,
+            markets_scanned=len(deduped), clusters=len(clusters),
+            relations_discovered=0, trades=[],
+        )
         send_summary_notification(
             markets_fetched=len(deduped), relations_discovered=0,
             trades_executed=0, trades_failed=0,
@@ -214,6 +229,7 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
     total_deployed = 0.0
     running_balance = balance.balance_usdc
     trades_remaining = MAX_TRADES_PER_RUN
+    trade_records: list[dict] = []
 
     for rel in relations:
         if trades_remaining <= 0:
@@ -295,9 +311,36 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
                 error=execution.error if not execution.success and not dry_run else None,
             )
 
+            # Record for history
+            trade_records.append(record_trade(
+                side=signal["side"],
+                follower_question=signal["follower_question"],
+                follower_condition_id=signal["follower_condition_id"],
+                follower_slug=follower_candidate.market_slug,
+                token_id=signal["token_id"],
+                leader_question=signal["leader_question"],
+                leader_outcome=leader_outcome,
+                confidence=signal["confidence"],
+                rationale=signal["rationale"],
+                bet_size_usdc=bet_size,
+                order_id=execution.order_id,
+                executed=execution.success,
+                error=execution.error if not execution.success else None,
+            ))
+
             time.sleep(1)
 
-    # --- Step 4: Summary ---
+    # --- Step 4: Save history + Summary ---
+    save_run(
+        mode="live" if not dry_run else "paper",
+        balance_before=balance.balance_usdc if not dry_run else None,
+        balance_after=running_balance if not dry_run else None,
+        markets_scanned=len(deduped),
+        clusters=len(clusters),
+        relations_discovered=len(relations),
+        trades=trade_records,
+    )
+
     final_balance = running_balance if not dry_run else None
     logger.info("Pipeline complete. Executed: %d, Failed: %d, Deployed: $%.2f",
                 trades_executed, trades_failed, total_deployed)
