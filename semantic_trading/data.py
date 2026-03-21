@@ -303,25 +303,72 @@ def get_terminal_price(prices: list[PricePoint]) -> Optional[float]:
     return prices[-1].price
 
 
-def fetch_active_markets(*, limit: int = 200) -> list[ResolvedMarket]:
-    """Fetch currently active (non-resolved) binary markets."""
-    params = {
-        "limit": limit,
-        "closed": "false",
-        "order": "volume",
-        "ascending": "false",
-        "active": "true",
-    }
-    with httpx.Client(timeout=_HTTP_TIMEOUT) as client:
-        resp = client.get(f"{GAMMA_API_BASE}/markets", params=params)
-        resp.raise_for_status()
-        raw_list = resp.json()
-
+def fetch_active_markets(*, limit: int = 200, exclude_sports: bool = True) -> list[ResolvedMarket]:
+    """Fetch currently active (non-resolved) binary markets with pagination."""
     markets: list[ResolvedMarket] = []
-    for raw in raw_list:
-        m = _parse_gamma_market(raw, require_outcome=False)
-        if m is not None:
-            duration = m.market_end_time - m.market_start_time
-            if duration >= timedelta(days=MIN_MARKET_DURATION_DAYS):
-                markets.append(m)
+    offset = 0
+    page_size = 100
+    max_pages = 20
+
+    for _ in range(max_pages):
+        params = {
+            "limit": page_size,
+            "offset": offset,
+            "closed": "false",
+            "order": "volume",
+            "ascending": "false",
+            "active": "true",
+        }
+        with httpx.Client(timeout=_HTTP_TIMEOUT) as client:
+            resp = client.get(f"{GAMMA_API_BASE}/markets", params=params)
+            resp.raise_for_status()
+            raw_list = resp.json()
+
+        if not raw_list:
+            break
+
+        for raw in raw_list:
+            m = _parse_gamma_market(raw, require_outcome=False)
+            if m is not None:
+                duration = m.market_end_time - m.market_start_time
+                if duration >= timedelta(days=MIN_MARKET_DURATION_DAYS):
+                    if exclude_sports and _is_sports_market(m.question):
+                        continue
+                    markets.append(m)
+
+        offset += page_size
+        if len(markets) >= limit:
+            markets = markets[:limit]
+            break
+        time.sleep(0.2)
+
+    logger.info("Fetched %d active non-sports markets", len(markets))
+    return markets
+
+
+def fetch_recently_resolved_markets(
+    *,
+    days_back: int = 3,
+    limit: int = 200,
+    exclude_sports: bool = True,
+) -> list[ResolvedMarket]:
+    """Fetch markets that resolved in the last N days."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
+    markets: list[ResolvedMarket] = []
+
+    page = _fetch_gamma_markets(closed=True, limit=limit, offset=0)
+    for raw in page:
+        m = _parse_gamma_market(raw)
+        if m is None:
+            continue
+        resolved_ts = m.resolved_on or m.market_end_time
+        if resolved_ts.tzinfo is None:
+            resolved_ts = resolved_ts.replace(tzinfo=timezone.utc)
+        if resolved_ts < cutoff:
+            continue
+        if exclude_sports and _is_sports_market(m.question):
+            continue
+        markets.append(m)
+
+    logger.info("Fetched %d recently resolved markets (last %d days)", len(markets), days_back)
     return markets

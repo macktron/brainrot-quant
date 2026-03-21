@@ -1,0 +1,50 @@
+name: Semantic Trading — Daily Pipeline
+
+on:
+  schedule:
+    # Run twice daily at 08:00 and 20:00 UTC
+    - cron: "0 8 * * *"
+    - cron: "0 20 * * *"
+  workflow_dispatch:
+    inputs:
+      live:
+        description: "Enable live trading (type 'true' to trade real money)"
+        required: false
+        default: "false"
+      trade_size:
+        description: "USDC per trade"
+        required: false
+        default: "5"
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
+          restore-keys: ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: pip install -e .
+
+      - name: Run trading pipeline
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          POLYMARKET_PRIVATE_KEY: ${{ secrets.POLYMARKET_PRIVATE_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TRADE_SIZE_USDC: ${{ github.event.inputs.trade_size || '5' }}
+          DRY_RUN: ${{ github.event.inputs.live == 'true' && 'false' || 'true' }}
+        run: python run_live.py --max-markets 300

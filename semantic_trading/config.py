@@ -13,6 +13,9 @@ DATA_DIR.mkdir(exist_ok=True)
 
 OPENAI_API_KEY: str = os.environ.get("OPENAI_API_KEY", "")
 POLYMARKET_PRIVATE_KEY: str = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
+DISCORD_WEBHOOK_URL: str = os.environ.get("DISCORD_WEBHOOK_URL", "")
+TRADE_SIZE_USDC: float = float(os.environ.get("TRADE_SIZE_USDC", "5.0"))
+DRY_RUN: bool = os.environ.get("DRY_RUN", "true").lower() in ("true", "1", "yes")
 
 EMBEDDING_MODEL = "text-embedding-3-small"
 LLM_MODEL = "gpt-4o"
