@@ -14,6 +14,9 @@ dependencies = [
     "httpx>=0.27",
 ]
 
+[tool.setuptools.packages.find]
+include = ["semantic_trading*"]
+
 [project.scripts]
 backtest = "run_backtest:main"
 live = "run_live:main"
