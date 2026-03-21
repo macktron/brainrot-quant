@@ -14,8 +14,16 @@ DATA_DIR.mkdir(exist_ok=True)
 OPENAI_API_KEY: str = os.environ.get("OPENAI_API_KEY", "")
 POLYMARKET_PRIVATE_KEY: str = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
 DISCORD_WEBHOOK_URL: str = os.environ.get("DISCORD_WEBHOOK_URL", "")
-TRADE_SIZE_USDC: float = float(os.environ.get("TRADE_SIZE_USDC", "5.0"))
 DRY_RUN: bool = os.environ.get("DRY_RUN", "true").lower() in ("true", "1", "yes")
+
+# Position sizing: fraction of available balance to risk per trade.
+# With ~93% win rate, full Kelly = 0.86, half-Kelly = 0.43.
+# We use ~0.20 per trade with max 4 trades/run = 80% max exposure.
+BET_FRACTION: float = float(os.environ.get("BET_FRACTION", "0.20"))
+MAX_TRADES_PER_RUN: int = int(os.environ.get("MAX_TRADES_PER_RUN", "4"))
+MIN_BET_USDC: float = 2.0
+LOW_BALANCE_THRESHOLD: float = 5.0
+BANKRUPT_THRESHOLD: float = 1.0
 
 EMBEDDING_MODEL = "text-embedding-3-small"
 LLM_MODEL = "gpt-4o"
