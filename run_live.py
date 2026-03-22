@@ -31,6 +31,7 @@ from semantic_trading.config import (
     DRY_RUN,
     GAMMA_API_BASE,
     MAX_TRADES_PER_RUN,
+    SKIP_EXISTING_POSITIONS,
 )
 from semantic_trading.data import (
     fetch_active_markets,
@@ -43,6 +44,11 @@ from semantic_trading.execute import (
     compute_trade_size,
     execute_trade,
     fetch_balance,
+)
+from semantic_trading.exposure import (
+    ExposureInfo,
+    filter_markets_by_exposure,
+    load_full_exposure,
 )
 from semantic_trading.history import record_trade, save_run
 from semantic_trading.labeling import label_all_clusters
@@ -162,6 +168,20 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
             logger.warning("LOW BALANCE: $%.2f — trades will be small", balance.balance_usdc)
             send_balance_alert(balance_usdc=balance.balance_usdc, is_bankrupt=False)
 
+    # --- Step 0b: Load existing exposure ---
+    exposure = ExposureInfo()
+    if not dry_run:
+        logger.info("Step 0b: Loading existing exposure...")
+        exposure = load_full_exposure(include_api_positions=True)
+        if exposure.positions:
+            logger.info(
+                "  Current exposure: %d positions, $%.2f total",
+                len(exposure.positions),
+                exposure.total_exposure_usdc,
+            )
+        else:
+            logger.info("  No existing positions found")
+
     # --- Step 1: Fetch markets ---
     logger.info("Step 1: Fetching markets...")
     active = fetch_active_markets(limit=max_markets)
@@ -222,6 +242,15 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
     # --- Step 3: Check for tradeable signals ---
     logger.info("Step 3: Checking for tradeable signals...")
     active_ids = {m.condition_id for m in active}
+
+    # Filter out markets we're already exposed to
+    if not dry_run and SKIP_EXISTING_POSITIONS:
+        tradeable_ids = filter_markets_by_exposure(active_ids, exposure)
+        skipped = len(active_ids) - len(tradeable_ids)
+        if skipped > 0:
+            logger.info("  Skipping %d markets with existing positions", skipped)
+        active_ids = tradeable_ids
+
     market_by_question: dict[str, ResolvedMarket] = {m.question: m for m in deduped}
 
     trades_executed = 0
@@ -263,6 +292,16 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
                 logger.warning("No token_id for follower, skipping")
                 continue
 
+            # Check exposure limits before sizing the trade
+            if not dry_run:
+                can_trade, reason = exposure.can_trade_market(
+                    follower_candidate.condition_id,
+                    proposed_size_usdc=1.0,  # minimum check
+                )
+                if not can_trade:
+                    logger.info("  Skipping trade: %s", reason)
+                    continue
+
             # Compute dynamic bet size
             bet_size = compute_trade_size(
                 running_balance, signal["confidence"], trades_remaining
@@ -291,6 +330,14 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
                     total_deployed += bet_size
                     running_balance -= bet_size
                     trades_remaining -= 1
+                    # Track this position in exposure
+                    exposure.add_position(
+                        condition_id=follower_candidate.condition_id,
+                        token_id=signal["token_id"],
+                        side=signal["side"],
+                        size_usdc=bet_size,
+                        question=signal["follower_question"],
+                    )
                     logger.info("Trade OK: order=%s, balance=$%.2f",
                                 execution.order_id, running_balance)
                 else:
