@@ -30,7 +30,9 @@ from semantic_trading.config import (
     DATA_DIR,
     DRY_RUN,
     GAMMA_API_BASE,
+    MAX_EXPOSURE_PER_MARKET,
     MAX_TRADES_PER_RUN,
+    SKIP_EXPOSED_MARKETS,
 )
 from semantic_trading.data import (
     fetch_active_markets,
@@ -39,10 +41,12 @@ from semantic_trading.data import (
 from semantic_trading.discovery import discover_all_relations
 from semantic_trading.execute import (
     BalanceInfo,
+    ExposureInfo,
     TradeExecution,
     compute_trade_size,
     execute_trade,
     fetch_balance,
+    fetch_positions,
 )
 from semantic_trading.history import record_trade, save_run
 from semantic_trading.labeling import label_all_clusters
@@ -146,10 +150,11 @@ def _determine_signal(
 def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
     """Run the full single-shot pipeline with dynamic position sizing."""
 
-    # --- Step 0: Check balance (live mode only) ---
+    # --- Step 0: Check balance and existing positions (live mode only) ---
     balance = BalanceInfo(balance_usdc=0.0, is_bankrupt=False, is_low=False)
+    exposure = ExposureInfo()
     if not dry_run:
-        logger.info("Step 0: Checking balance...")
+        logger.info("Step 0a: Checking balance...")
         balance = fetch_balance()
         logger.info("  Balance: $%.2f USDC", balance.balance_usdc)
 
@@ -160,6 +165,22 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
 
         if balance.is_low:
             logger.warning("LOW BALANCE: $%.2f — trades will be small", balance.balance_usdc)
+
+        logger.info("Step 0b: Checking existing positions...")
+        exposure = fetch_positions()
+        if exposure.positions:
+            logger.info(
+                "  Existing exposure: $%.2f across %d markets",
+                exposure.total_exposure,
+                len(exposure.exposure_by_condition),
+            )
+            if SKIP_EXPOSED_MARKETS:
+                logger.info("  Mode: SKIP exposed markets entirely")
+            else:
+                logger.info(
+                    "  Mode: CAP exposure at %.0f%% of balance per market",
+                    MAX_EXPOSURE_PER_MARKET * 100,
+                )
             send_balance_alert(balance_usdc=balance.balance_usdc, is_bankrupt=False)
 
     # --- Step 1: Fetch markets ---
@@ -250,6 +271,34 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
             if follower_candidate.condition_id not in active_ids:
                 continue
 
+            # --- Exposure check ---
+            follower_cid = follower_candidate.condition_id
+            current_exposure = exposure.get_market_exposure(follower_cid)
+
+            if not dry_run and exposure.is_market_exposed(follower_cid):
+                if SKIP_EXPOSED_MARKETS:
+                    logger.info(
+                        "SKIP: Already exposed to '%s' ($%.2f) — SKIP_EXPOSED_MARKETS=true",
+                        follower_candidate.question[:50], current_exposure,
+                    )
+                    continue
+                else:
+                    remaining_capacity = exposure.get_remaining_capacity(
+                        follower_cid, balance.balance_usdc
+                    )
+                    if remaining_capacity <= 0:
+                        logger.info(
+                            "SKIP: Market '%s' at max exposure ($%.2f >= %.0f%% of balance)",
+                            follower_candidate.question[:50],
+                            current_exposure,
+                            MAX_EXPOSURE_PER_MARKET * 100,
+                        )
+                        continue
+                    logger.info(
+                        "PARTIAL: Market '%s' has $%.2f exposure, $%.2f capacity remaining",
+                        follower_candidate.question[:50], current_exposure, remaining_capacity,
+                    )
+
             resolved_data = _check_market_resolved(
                 leader_candidate.condition_id, slug=leader_candidate.market_slug
             )
@@ -263,15 +312,28 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
                 logger.warning("No token_id for follower, skipping")
                 continue
 
-            # Compute dynamic bet size
-            bet_size = compute_trade_size(
-                running_balance, signal["confidence"], trades_remaining
-            ) if not dry_run else 0.0
+            # Compute dynamic bet size (accounting for exposure limits)
+            bet_size = 0.0
+            if not dry_run:
+                bet_size = compute_trade_size(
+                    running_balance, signal["confidence"], trades_remaining
+                )
+                # Cap to remaining exposure capacity if we have existing exposure
+                if current_exposure > 0:
+                    remaining_capacity = exposure.get_remaining_capacity(
+                        follower_cid, balance.balance_usdc
+                    )
+                    if bet_size > remaining_capacity:
+                        logger.info(
+                            "Reducing bet from $%.2f to $%.2f (exposure cap)",
+                            bet_size, remaining_capacity,
+                        )
+                        bet_size = remaining_capacity
 
             logger.info(
-                "SIGNAL: BUY %s on '%s' (conf=%.0f%%, size=$%.2f)",
+                "SIGNAL: BUY %s on '%s' (conf=%.0f%%, size=$%.2f, existing=$%.2f)",
                 signal["side"], signal["follower_question"][:55],
-                signal["confidence"] * 100, bet_size,
+                signal["confidence"] * 100, bet_size, current_exposure,
             )
 
             # Save signal
@@ -291,8 +353,14 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
                     total_deployed += bet_size
                     running_balance -= bet_size
                     trades_remaining -= 1
-                    logger.info("Trade OK: order=%s, balance=$%.2f",
-                                execution.order_id, running_balance)
+                    # Update exposure tracking for this run (prevents multiple trades on same market)
+                    exposure.exposure_by_condition[follower_cid] = (
+                        exposure.exposure_by_condition.get(follower_cid, 0.0) + bet_size
+                    )
+                    exposure.total_exposure += bet_size
+                    logger.info("Trade OK: order=%s, balance=$%.2f, market_exposure=$%.2f",
+                                execution.order_id, running_balance,
+                                exposure.get_market_exposure(follower_cid))
                 else:
                     trades_failed += 1
                     logger.error("Trade FAILED: %s", execution.error)

@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from semantic_trading.config import (
     BANKRUPT_THRESHOLD,
     BET_FRACTION,
     CLOB_API_BASE,
     LOW_BALANCE_THRESHOLD,
+    MAX_EXPOSURE_PER_MARKET,
     MAX_TRADES_PER_RUN,
     MIN_BET_USDC,
     POLY_API_KEY,
@@ -17,6 +18,7 @@ from semantic_trading.config import (
     POLY_FUNDER,
     POLY_PASSPHRASE,
     POLYMARKET_PRIVATE_KEY,
+    SKIP_EXPOSED_MARKETS,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,6 +39,47 @@ class BalanceInfo:
     balance_usdc: float
     is_bankrupt: bool
     is_low: bool
+
+
+@dataclass
+class Position:
+    """Represents an existing position on a market."""
+    token_id: str
+    condition_id: str
+    size: float  # number of shares
+    avg_price: float  # average entry price (0-1)
+    side: str  # YES or NO
+    cost_basis: float = 0.0  # approximate USDC invested
+
+    def __post_init__(self):
+        self.cost_basis = self.size * self.avg_price
+
+
+@dataclass
+class ExposureInfo:
+    """Tracks exposure across all positions."""
+    positions: list[Position] = field(default_factory=list)
+    exposure_by_condition: dict[str, float] = field(default_factory=dict)
+    exposure_by_token: dict[str, float] = field(default_factory=dict)
+    total_exposure: float = 0.0
+
+    def get_market_exposure(self, condition_id: str) -> float:
+        """Get total USDC exposure for a specific market."""
+        return self.exposure_by_condition.get(condition_id, 0.0)
+
+    def is_market_exposed(self, condition_id: str) -> bool:
+        """Check if we have any exposure to this market."""
+        return condition_id in self.exposure_by_condition
+
+    def get_remaining_capacity(self, condition_id: str, balance: float) -> float:
+        """Get remaining capacity to add exposure to a market.
+
+        Returns the max additional USDC we can deploy on this market
+        without exceeding MAX_EXPOSURE_PER_MARKET.
+        """
+        current = self.get_market_exposure(condition_id)
+        max_allowed = balance * MAX_EXPOSURE_PER_MARKET
+        return max(0.0, max_allowed - current)
 
 
 def _get_clob_client():
@@ -68,6 +111,82 @@ def _get_clob_client():
         client.set_api_creds(creds)
 
     return client
+
+
+def fetch_positions() -> ExposureInfo:
+    """Fetch all current positions from Polymarket and calculate exposure.
+
+    Returns an ExposureInfo object with:
+    - List of all positions
+    - Exposure by condition_id (market)
+    - Exposure by token_id
+    - Total exposure across all positions
+    """
+    if not POLYMARKET_PRIVATE_KEY:
+        logger.warning("No private key set, cannot fetch positions")
+        return ExposureInfo()
+
+    try:
+        client = _get_clob_client()
+        raw_positions = client.get_positions()
+
+        if not raw_positions:
+            logger.info("No existing positions found")
+            return ExposureInfo()
+
+        positions: list[Position] = []
+        exposure_by_condition: dict[str, float] = {}
+        exposure_by_token: dict[str, float] = {}
+        total_exposure = 0.0
+
+        for pos in raw_positions:
+            try:
+                asset = pos.get("asset", {})
+                token_id = asset.get("token_id", "")
+                condition_id = asset.get("condition_id", "")
+                size = float(pos.get("size", 0))
+                avg_price = float(pos.get("avgPrice", 0))
+                side = pos.get("side", "").upper()
+
+                if size <= 0:
+                    continue
+
+                position = Position(
+                    token_id=token_id,
+                    condition_id=condition_id,
+                    size=size,
+                    avg_price=avg_price,
+                    side=side,
+                )
+                positions.append(position)
+
+                exposure_by_condition[condition_id] = (
+                    exposure_by_condition.get(condition_id, 0.0) + position.cost_basis
+                )
+                exposure_by_token[token_id] = (
+                    exposure_by_token.get(token_id, 0.0) + position.cost_basis
+                )
+                total_exposure += position.cost_basis
+
+            except (KeyError, ValueError, TypeError) as e:
+                logger.warning("Failed to parse position: %s — %s", pos, e)
+                continue
+
+        logger.info(
+            "Fetched %d positions, total exposure: $%.2f across %d markets",
+            len(positions), total_exposure, len(exposure_by_condition)
+        )
+
+        return ExposureInfo(
+            positions=positions,
+            exposure_by_condition=exposure_by_condition,
+            exposure_by_token=exposure_by_token,
+            total_exposure=total_exposure,
+        )
+
+    except Exception as e:
+        logger.error("Failed to fetch positions: %s", e)
+        return ExposureInfo()
 
 
 def fetch_balance() -> BalanceInfo:

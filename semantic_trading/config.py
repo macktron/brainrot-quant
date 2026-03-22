@@ -29,6 +29,14 @@ MIN_BET_USDC: float = 2.0
 LOW_BALANCE_THRESHOLD: float = 5.0
 BANKRUPT_THRESHOLD: float = 1.0
 
+# Exposure management: prevent over-concentration in single markets
+# SKIP_EXPOSED_MARKETS: if true, skip any market we already have a position in
+# MAX_EXPOSURE_PER_MARKET: max fraction of total balance allowed per market (0.0-1.0)
+#   e.g., 0.30 = max 30% of balance in any single market
+# When a market is partially exposed, new trades are sized to fill remaining capacity
+SKIP_EXPOSED_MARKETS: bool = os.environ.get("SKIP_EXPOSED_MARKETS", "false").lower() in ("true", "1", "yes")
+MAX_EXPOSURE_PER_MARKET: float = float(os.environ.get("MAX_EXPOSURE_PER_MARKET", "0.30"))
+
 EMBEDDING_MODEL = "text-embedding-3-small"
 LLM_MODEL = "gpt-4o"
 
