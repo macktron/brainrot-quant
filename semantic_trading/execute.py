@@ -12,6 +12,10 @@ from semantic_trading.config import (
     LOW_BALANCE_THRESHOLD,
     MAX_TRADES_PER_RUN,
     MIN_BET_USDC,
+    POLY_API_KEY,
+    POLY_API_SECRET,
+    POLY_FUNDER,
+    POLY_PASSPHRASE,
     POLYMARKET_PRIVATE_KEY,
 )
 
@@ -36,12 +40,33 @@ class BalanceInfo:
 
 
 def _get_clob_client():
-    """Lazily import and initialize the CLOB client."""
+    """Lazily import and initialize the CLOB client with L2 auth."""
     from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import ApiCreds
 
-    client = ClobClient(CLOB_API_BASE, key=POLYMARKET_PRIVATE_KEY, chain_id=CHAIN_ID)
-    creds = client.create_or_derive_api_creds()
-    client.set_api_creds(creds)
+    if POLY_API_KEY and POLY_API_SECRET and POLY_PASSPHRASE:
+        # Ensure base64 padding — Polymarket may return secrets without trailing '='
+        secret = POLY_API_SECRET
+        if len(secret) % 4:
+            secret += "=" * (4 - len(secret) % 4)
+        creds = ApiCreds(
+            api_key=POLY_API_KEY,
+            api_secret=secret,
+            api_passphrase=POLY_PASSPHRASE,
+        )
+        client = ClobClient(
+            CLOB_API_BASE,
+            key=POLYMARKET_PRIVATE_KEY,
+            chain_id=CHAIN_ID,
+            creds=creds,
+            signature_type=1,
+            funder=POLY_FUNDER or None,
+        )
+    else:
+        client = ClobClient(CLOB_API_BASE, key=POLYMARKET_PRIVATE_KEY, chain_id=CHAIN_ID)
+        creds = client.create_or_derive_api_creds()
+        client.set_api_creds(creds)
+
     return client
 
 

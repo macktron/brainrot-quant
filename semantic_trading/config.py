@@ -13,6 +13,10 @@ DATA_DIR.mkdir(exist_ok=True)
 
 OPENAI_API_KEY: str = os.environ.get("OPENAI_API_KEY", "")
 POLYMARKET_PRIVATE_KEY: str = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
+POLY_API_KEY: str = os.environ.get("POLY_API_KEY", "")
+POLY_API_SECRET: str = os.environ.get("POLY_API_SECRET", "")
+POLY_PASSPHRASE: str = os.environ.get("POLY_PASSPHRASE", "")
+POLY_FUNDER: str = os.environ.get("POLY_FUNDER", "")
 DISCORD_WEBHOOK_URL: str = os.environ.get("DISCORD_WEBHOOK_URL", "")
 DRY_RUN: bool = os.environ.get("DRY_RUN", "true").lower() in ("true", "1", "yes")
 
