@@ -29,6 +29,16 @@ MIN_BET_USDC: float = 2.0
 LOW_BALANCE_THRESHOLD: float = 5.0
 BANKRUPT_THRESHOLD: float = 1.0
 
+# Exposure management: prevent adding to existing positions
+# SKIP_EXISTING_POSITIONS: if True, skip markets we already have a position in
+SKIP_EXISTING_POSITIONS: bool = os.environ.get("SKIP_EXISTING_POSITIONS", "true").lower() in ("true", "1", "yes")
+# MAX_EXPOSURE_PER_MARKET_USDC: max $ exposure per individual market (0 = no limit)
+MAX_EXPOSURE_PER_MARKET_USDC: float = float(os.environ.get("MAX_EXPOSURE_PER_MARKET_USDC", "0"))
+# MAX_EXPOSURE_PER_CATEGORY_USDC: max $ exposure per category like politics, crypto (0 = no limit)
+MAX_EXPOSURE_PER_CATEGORY_USDC: float = float(os.environ.get("MAX_EXPOSURE_PER_CATEGORY_USDC", "0"))
+# MAX_TOTAL_EXPOSURE_USDC: max total open exposure across all markets (0 = no limit)
+MAX_TOTAL_EXPOSURE_USDC: float = float(os.environ.get("MAX_TOTAL_EXPOSURE_USDC", "0"))
+
 EMBEDDING_MODEL = "text-embedding-3-small"
 LLM_MODEL = "gpt-4o"
 
