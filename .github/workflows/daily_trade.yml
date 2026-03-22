@@ -6,7 +6,19 @@ on:
     - cron: "0 8 * * *"
     - cron: "0 20 * * *"
   workflow_dispatch:
-    # Manual trigger is ALWAYS paper trading (for testing)
+    inputs:
+      trading_mode:
+        description: "Choose whether to paper trade or live trade"
+        required: true
+        default: paper
+        type: choice
+        options:
+          - paper
+          - live
+      live_confirmation:
+        description: "Type TRADE_LIVE to allow a manual live run"
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -35,6 +47,27 @@ jobs:
       - name: Install dependencies
         run: pip install -e .
 
+      - name: Validate manual live confirmation
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [ "${{ inputs.trading_mode }}" = "live" ] && [ "${{ inputs.live_confirmation }}" != "TRADE_LIVE" ]; then
+            echo "Manual live trading requires live_confirmation=TRADE_LIVE"
+            exit 1
+          fi
+
+      - name: Select trading mode
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "DRY_RUN=false" >> "$GITHUB_ENV"
+            echo "RUN_MODE=live (scheduled)" >> "$GITHUB_ENV"
+          elif [ "${{ inputs.trading_mode }}" = "live" ]; then
+            echo "DRY_RUN=false" >> "$GITHUB_ENV"
+            echo "RUN_MODE=live (manual)" >> "$GITHUB_ENV"
+          else
+            echo "DRY_RUN=true" >> "$GITHUB_ENV"
+            echo "RUN_MODE=paper (manual)" >> "$GITHUB_ENV"
+          fi
+
       - name: Run trading pipeline
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -44,8 +77,8 @@ jobs:
           POLY_PASSPHRASE: ${{ secrets.POLY_PASSPHRASE }}
           POLY_FUNDER: ${{ secrets.POLY_FUNDER }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          # Scheduled = LIVE, manual trigger = PAPER
-          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && 'true' || 'false' }}
+          # Scheduled runs are live. Manual runs follow the selected mode.
+          DRY_RUN: ${{ env.DRY_RUN }}
         run: python run_live.py --max-markets 2000
 
       - name: Commit run history
