@@ -1,7 +1,10 @@
 """Structured run history for P&L tracking and dashboard consumption.
 
-Appends one JSON line per pipeline run to history/runs.jsonl.
-Designed to be joined with on-chain trade data via condition_id / token_id.
+Appends one JSON line per live run to ``history/runs_live.jsonl`` and one line
+per paper run to ``history/runs_paper.jsonl``.
+
+Older mock/scratch data may exist in ``history/runs.jsonl``, but it is not
+read or written by this module.
 """
 
 from __future__ import annotations
@@ -70,7 +73,11 @@ def save_run(
     relations_discovered: int,
     trades: list[dict[str, Any]],
 ) -> Path:
-    """Append a single run record as one JSON line to runs.jsonl."""
+    """Append a single run record to the appropriate history file.
+
+    - LIVE runs → ``history/runs_live.jsonl``
+    - PAPER runs → ``history/runs_paper.jsonl``
+    """
     now = datetime.now(timezone.utc)
 
     executed = [t for t in trades if t.get("executed")]
