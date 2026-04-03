@@ -32,6 +32,8 @@ from semantic_trading.config import (
     DRY_RUN,
     GAMMA_API_BASE,
     MAX_TRADES_PER_RUN,
+    PAPER_ASSUMED_BALANCE_USDC,
+    PAPER_RESPECT_EXPOSURE,
     SKIP_EXISTING_POSITIONS,
 )
 from semantic_trading.data import (
@@ -122,6 +124,16 @@ def _check_market_resolved(condition_id: str, slug: str = "") -> dict | None:
     return None
 
 
+def _normalize_binary_outcome(raw: str) -> str | None:
+    """Map API/outcome strings to canonical Yes/No for signal logic."""
+    s = raw.strip().lower()
+    if s in ("yes", "y", "1", "true"):
+        return "Yes"
+    if s in ("no", "n", "0", "false"):
+        return "No"
+    return None
+
+
 def _determine_signal(
     relation: MarketRelation,
     leader: ResolvedMarket,
@@ -129,7 +141,8 @@ def _determine_signal(
     follower: ResolvedMarket,
 ) -> dict:
     """Determine trade signal when leader resolves."""
-    leader_yes = leader_outcome.lower() == "yes"
+    canon = _normalize_binary_outcome(leader_outcome)
+    leader_yes = (canon or leader_outcome.strip()).lower() == "yes"
     buy_yes = (leader_yes and relation.is_same_outcome) or (
         not leader_yes and not relation.is_same_outcome
     )
@@ -161,9 +174,21 @@ def _normalize_question(q: str) -> str:
     return q.strip().lower()
 
 
+def _try_cached_leader_outcome(leader: ResolvedMarket) -> str | None:
+    """Use in-memory outcome when leader was fetched as resolved (avoids extra Gamma call)."""
+    o = (leader.outcome or "").strip()
+    if not o:
+        return None
+    canon = _normalize_binary_outcome(o)
+    if canon:
+        return canon
+    if o.lower() in ("yes", "no"):
+        return "Yes" if o.lower() == "yes" else "No"
+    return None
+
+
 def _resolve_market_by_question(
     question: str,
-    markets: list[ResolvedMarket],
     *,
     market_by_question_exact: dict[str, ResolvedMarket],
     market_by_question_norm: dict[str, ResolvedMarket],
@@ -177,12 +202,32 @@ def _resolve_market_by_question(
     if nq in market_by_question_norm:
         return market_by_question_norm[nq]
 
-    # Last resort: substring match on normalized strings.
+    # Last resort: substring match on normalized strings — prefer longest key (reduces ambiguity).
+    candidates: list[tuple[int, str]] = []  # (score, normalized_key)
     for mk in normalized_market_keys:
         if nq in mk or mk in nq:
-            return market_by_question_norm.get(mk)
-
-    return None
+            score = max(len(nq), len(mk))
+            candidates.append((score, mk))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: (-t[0], t[1]))
+    best_score, best_mk = candidates[0]
+    tied_at_best = [c for c in candidates if c[0] == best_score]
+    if len(tied_at_best) > 1:
+        logger.warning(
+            "Ambiguous question match (%d ties at score %d) for %r; using %r",
+            len(tied_at_best),
+            best_score,
+            question[:120],
+            market_by_question_norm[best_mk].question[:120],
+        )
+    else:
+        logger.warning(
+            "Question resolved via substring match (not exact): %r -> %r",
+            question[:120],
+            market_by_question_norm[best_mk].question[:120],
+        )
+    return market_by_question_norm.get(best_mk)
 
 
 def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
@@ -204,9 +249,10 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
             logger.warning("LOW BALANCE: $%.2f — trades will be small", balance.balance_usdc)
             send_balance_alert(balance_usdc=balance.balance_usdc, is_bankrupt=False)
 
-    # --- Step 0b: Load existing exposure ---
+    # --- Step 0b: Load existing exposure (live always; paper when mirroring live) ---
     exposure = ExposureInfo()
-    if not dry_run:
+    load_exposure = (not dry_run) or (dry_run and PAPER_RESPECT_EXPOSURE)
+    if load_exposure:
         logger.info("Step 0b: Loading existing exposure...")
         exposure = load_full_exposure(include_api_positions=True)
         if exposure.positions:
@@ -279,8 +325,8 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
     logger.info("Step 3: Checking for tradeable signals...")
     active_ids = {m.condition_id for m in active}
 
-    # Filter out markets we're already exposed to
-    if not dry_run and SKIP_EXISTING_POSITIONS:
+    # Filter out markets we're already exposed to (live; paper when PAPER_RESPECT_EXPOSURE)
+    if SKIP_EXISTING_POSITIONS and load_exposure:
         tradeable_ids = filter_markets_by_exposure(active_ids, exposure)
         skipped = len(active_ids) - len(tradeable_ids)
         if skipped > 0:
@@ -314,14 +360,12 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
 
         mi = _resolve_market_by_question(
             rel.question_i,
-            deduped,
             market_by_question_exact=market_by_question_exact,
             market_by_question_norm=market_by_question_norm,
             normalized_market_keys=normalized_market_keys,
         )
         mj = _resolve_market_by_question(
             rel.question_j,
-            deduped,
             market_by_question_exact=market_by_question_exact,
             market_by_question_norm=market_by_question_norm,
             normalized_market_keys=normalized_market_keys,
@@ -341,14 +385,20 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
                 n_attempts_followers_not_active += 1
                 continue
 
-            resolved_data = _check_market_resolved(
-                leader_candidate.condition_id, slug=leader_candidate.market_slug
-            )
-            if not resolved_data or not resolved_data.get("outcome"):
-                n_attempts_leader_not_resolved += 1
-                continue
+            leader_outcome: str | None = None
+            cached_o = _try_cached_leader_outcome(leader_candidate)
+            if cached_o:
+                leader_outcome = cached_o
+            else:
+                resolved_data = _check_market_resolved(
+                    leader_candidate.condition_id, slug=leader_candidate.market_slug
+                )
+                if not resolved_data or not resolved_data.get("outcome"):
+                    n_attempts_leader_not_resolved += 1
+                    continue
+                raw_o = resolved_data["outcome"]
+                leader_outcome = _normalize_binary_outcome(raw_o) or raw_o.strip()
 
-            leader_outcome = resolved_data["outcome"]
             signal = _determine_signal(rel, leader_candidate, leader_outcome, follower_candidate)
 
             if not signal["token_id"]:
@@ -357,7 +407,7 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
                 continue
 
             # Check exposure limits before sizing the trade
-            if not dry_run:
+            if load_exposure:
                 can_trade, reason = exposure.can_trade_market(
                     follower_candidate.condition_id,
                     proposed_size_usdc=1.0,  # minimum check
@@ -366,10 +416,17 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
                     logger.info("  Skipping trade: %s", reason)
                     continue
 
-            # Compute dynamic bet size
-            bet_size = compute_trade_size(
-                running_balance, signal["confidence"], trades_remaining
-            ) if not dry_run else 0.0
+            # Compute dynamic bet size (live: real balance; paper: optional hypothetical)
+            if not dry_run:
+                bet_size = compute_trade_size(
+                    running_balance, signal["confidence"], trades_remaining
+                )
+            elif PAPER_ASSUMED_BALANCE_USDC > 0:
+                bet_size = compute_trade_size(
+                    PAPER_ASSUMED_BALANCE_USDC, signal["confidence"], trades_remaining
+                )
+            else:
+                bet_size = 0.0
 
             logger.info(
                 "SIGNAL: BUY %s on '%s' (conf=%.0f%%, size=$%.2f)",
@@ -407,6 +464,8 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
                 else:
                     trades_failed += 1
                     logger.error("Trade FAILED: %s", execution.error)
+            elif dry_run:
+                trades_remaining -= 1
 
             # Notify
             send_trade_notification(
@@ -416,7 +475,7 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
                 leader_outcome=leader_outcome,
                 confidence=signal["confidence"],
                 rationale=signal["rationale"],
-                amount_usdc=bet_size if not dry_run else None,
+                amount_usdc=bet_size if not dry_run or bet_size > 0 else None,
                 balance_after=running_balance if not dry_run else None,
                 order_id=execution.order_id,
                 error=execution.error if not execution.success and not dry_run else None,

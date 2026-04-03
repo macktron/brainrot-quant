@@ -29,6 +29,15 @@ MIN_BET_USDC: float = 2.0
 LOW_BALANCE_THRESHOLD: float = 5.0
 BANKRUPT_THRESHOLD: float = 1.0
 
+# Paper mode: mirror live exposure filtering (skip markets we already hold)
+PAPER_RESPECT_EXPOSURE: bool = os.environ.get("PAPER_RESPECT_EXPOSURE", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+# Hypothetical sizing for paper logs/notifications only (no orders). 0 = omit size.
+PAPER_ASSUMED_BALANCE_USDC: float = float(os.environ.get("PAPER_ASSUMED_BALANCE_USDC", "0"))
+
 # Exposure management: prevent adding to existing positions
 # SKIP_EXISTING_POSITIONS: if True, skip markets we already have a position in
 SKIP_EXISTING_POSITIONS: bool = os.environ.get("SKIP_EXISTING_POSITIONS", "true").lower() in ("true", "1", "yes")
