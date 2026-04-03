@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import time
 from datetime import datetime, timezone
 
@@ -149,6 +150,41 @@ def _determine_signal(
     }
 
 
+def _normalize_question(q: str) -> str:
+    """Normalize question text for robust matching with LLM output."""
+    q = q.strip()
+    # GPT sometimes echoes questions as bullet items.
+    if q.startswith("- "):
+        q = q[2:].strip()
+    # Mirror backtester logic for removing date suffixes.
+    q = re.sub(r"\s*\(start:.*$", "", q)
+    return q.strip().lower()
+
+
+def _resolve_market_by_question(
+    question: str,
+    markets: list[ResolvedMarket],
+    *,
+    market_by_question_exact: dict[str, ResolvedMarket],
+    market_by_question_norm: dict[str, ResolvedMarket],
+    normalized_market_keys: list[str],
+) -> ResolvedMarket | None:
+    """Resolve a market from an LLM-provided question string."""
+    if question in market_by_question_exact:
+        return market_by_question_exact[question]
+
+    nq = _normalize_question(question)
+    if nq in market_by_question_norm:
+        return market_by_question_norm[nq]
+
+    # Last resort: substring match on normalized strings.
+    for mk in normalized_market_keys:
+        if nq in mk or mk in nq:
+            return market_by_question_norm.get(mk)
+
+    return None
+
+
 def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
     """Run the full single-shot pipeline with dynamic position sizing."""
 
@@ -251,7 +287,11 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
             logger.info("  Skipping %d markets with existing positions", skipped)
         active_ids = tradeable_ids
 
-    market_by_question: dict[str, ResolvedMarket] = {m.question: m for m in deduped}
+    market_by_question_exact: dict[str, ResolvedMarket] = {m.question: m for m in deduped}
+    market_by_question_norm: dict[str, ResolvedMarket] = {}
+    for m in deduped:
+        market_by_question_norm.setdefault(_normalize_question(m.question), m)
+    normalized_market_keys = list(market_by_question_norm.keys())
 
     trades_executed = 0
     trades_failed = 0
@@ -260,29 +300,52 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
     trades_remaining = MAX_TRADES_PER_RUN
     trade_records: list[dict] = []
 
+    # Debug counters: helps explain why we may get 0 trades.
+    n_relations_failed_market_lookup = 0
+    n_attempts_followers_not_active = 0
+    n_attempts_leader_not_resolved = 0
+    n_attempts_missing_token = 0
+    n_attempts_date_mismatch = 0
+
     for rel in relations:
         if trades_remaining <= 0:
             logger.info("Max trades per run reached (%d), stopping", MAX_TRADES_PER_RUN)
             break
 
-        mi = market_by_question.get(rel.question_i)
-        mj = market_by_question.get(rel.question_j)
+        mi = _resolve_market_by_question(
+            rel.question_i,
+            deduped,
+            market_by_question_exact=market_by_question_exact,
+            market_by_question_norm=market_by_question_norm,
+            normalized_market_keys=normalized_market_keys,
+        )
+        mj = _resolve_market_by_question(
+            rel.question_j,
+            deduped,
+            market_by_question_exact=market_by_question_exact,
+            market_by_question_norm=market_by_question_norm,
+            normalized_market_keys=normalized_market_keys,
+        )
         if not mi or not mj:
+            n_relations_failed_market_lookup += 1
             continue
 
         if _is_date_resolution_mismatch(rel.question_i, rel.question_j):
+            n_attempts_date_mismatch += 1
             continue
 
         for leader_candidate, follower_candidate in [(mi, mj), (mj, mi)]:
             if trades_remaining <= 0:
                 break
             if follower_candidate.condition_id not in active_ids:
+                n_attempts_followers_not_active += 1
                 continue
 
             resolved_data = _check_market_resolved(
                 leader_candidate.condition_id, slug=leader_candidate.market_slug
             )
             if not resolved_data or not resolved_data.get("outcome"):
+                n_attempts_leader_not_resolved += 1
                 continue
 
             leader_outcome = resolved_data["outcome"]
@@ -290,6 +353,7 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
 
             if not signal["token_id"]:
                 logger.warning("No token_id for follower, skipping")
+                n_attempts_missing_token += 1
                 continue
 
             # Check exposure limits before sizing the trade
@@ -378,6 +442,16 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
             time.sleep(1)
 
     # --- Step 4: Save history + Summary ---
+    logger.info(
+        "Signal debug (why trades may be 0): "
+        "market_lookup_fail=%d, date_mismatch=%d, follower_not_active=%d, "
+        "leader_not_resolved=%d, missing_token=%d",
+        n_relations_failed_market_lookup,
+        n_attempts_date_mismatch,
+        n_attempts_followers_not_active,
+        n_attempts_leader_not_resolved,
+        n_attempts_missing_token,
+    )
     save_run(
         mode="live" if not dry_run else "paper",
         balance_before=balance.balance_usdc if not dry_run else None,
