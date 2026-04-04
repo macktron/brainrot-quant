@@ -18,6 +18,16 @@ POLY_API_SECRET: str = os.environ.get("POLY_API_SECRET", "")
 POLY_PASSPHRASE: str = os.environ.get("POLY_PASSPHRASE", "")
 POLY_FUNDER: str = os.environ.get("POLY_FUNDER", "")
 DISCORD_WEBHOOK_URL: str = os.environ.get("DISCORD_WEBHOOK_URL", "")
+# Discord embed per successfully executed (filled) live order only — not skips/paper/failures.
+DISCORD_NOTIFY_EXECUTED_TRADES: bool = os.environ.get(
+    "DISCORD_NOTIFY_EXECUTED_TRADES", "true"
+).lower() in ("true", "1", "yes")
+# OpenAI blurb in daily summary explaining why trades did/did not fire.
+DISCORD_SUMMARY_LLM: bool = os.environ.get("DISCORD_SUMMARY_LLM", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
 DRY_RUN: bool = os.environ.get("DRY_RUN", "true").lower() in ("true", "1", "yes")
 
 # Position sizing: fraction of available balance to risk per trade.
@@ -25,7 +35,7 @@ DRY_RUN: bool = os.environ.get("DRY_RUN", "true").lower() in ("true", "1", "yes"
 # We use ~0.20 per trade with max 4 trades/run = 80% max exposure.
 BET_FRACTION: float = float(os.environ.get("BET_FRACTION", "0.20"))
 MAX_TRADES_PER_RUN: int = int(os.environ.get("MAX_TRADES_PER_RUN", "4"))
-MIN_BET_USDC: float = 2.0
+MIN_BET_USDC: float = float(os.environ.get("MIN_BET_USDC", "2"))
 LOW_BALANCE_THRESHOLD: float = 5.0
 BANKRUPT_THRESHOLD: float = 1.0
 
@@ -74,6 +84,11 @@ TERMINAL_PRICE_CUTOFF = 0.1
 MIN_MARKET_DURATION_DAYS = 7
 MAX_PAIR_GAP_DAYS = 90
 ONLY_SAME_OUTCOME = True
+
+# Treat leader YES/NO market price >= this as "known" outcome before official resolution (0 = off).
+LEADER_PRICE_CERTAINTY_THRESHOLD: float = float(
+    os.environ.get("LEADER_PRICE_CERTAINTY_THRESHOLD", "0.9")
+)
 
 # Sports/game patterns to filter out -- these are independent events with no causal link
 SPORTS_EXCLUDE_PATTERNS = [

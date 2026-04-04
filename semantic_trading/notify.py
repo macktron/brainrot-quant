@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 
 import httpx
 
-from semantic_trading.config import DISCORD_WEBHOOK_URL
+from semantic_trading.config import DISCORD_NOTIFY_EXECUTED_TRADES, DISCORD_WEBHOOK_URL
 
 logger = logging.getLogger(__name__)
 
@@ -41,16 +41,18 @@ def send_trade_notification(
     order_id: str | None = None,
     error: str | None = None,
 ) -> bool:
-    """Send a trade signal notification to Discord."""
+    """Send a Discord embed for a successfully executed live order (filled trades only)."""
+    if not DISCORD_NOTIFY_EXECUTED_TRADES:
+        return False
     status_emoji = "🟢" if order_id else ("🔴" if error else "🟡")
     status_text = (
-        f"Executed (order: `{order_id}`)"
+        f"Filled (order: `{order_id}`)"
         if order_id
         else (f"FAILED: {error}" if error else "Signal only (paper trade)")
     )
 
     embed = {
-        "title": f"{status_emoji} Trade Signal: BUY **{side}**",
+        "title": f"{status_emoji} Trade filled: BUY **{side}**",
         "color": 0x00CC66 if order_id else (0xFF4444 if error else 0xFFAA00),
         "fields": [
             {"name": "Follower Market", "value": follower_question[:200], "inline": False},
@@ -89,6 +91,8 @@ def send_summary_notification(
     balance_usdc: float | None = None,
     total_deployed: float = 0.0,
     dry_run: bool = False,
+    run_digest: str | None = None,
+    trades_taken_lines: list[str] | None = None,
 ) -> bool:
     """Send a daily run summary to Discord."""
     mode = "PAPER TRADE" if dry_run else "LIVE"
@@ -116,6 +120,23 @@ def send_summary_notification(
             "name": "Deployed This Run",
             "value": f"${total_deployed:.2f} USDC",
             "inline": True,
+        })
+
+    if trades_taken_lines:
+        body = "\n".join(trades_taken_lines[:12])
+        if len(trades_taken_lines) > 12:
+            body += f"\n… +{len(trades_taken_lines) - 12} more"
+        embed["fields"].append({
+            "name": "Trades taken",
+            "value": body[:1020] or "(none)",
+            "inline": False,
+        })
+
+    if run_digest:
+        embed["fields"].append({
+            "name": "Why (this run)",
+            "value": run_digest[:1020],
+            "inline": False,
         })
 
     return _send_discord({"username": "Semantic Trader", "embeds": [embed]})

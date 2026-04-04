@@ -29,8 +29,10 @@ from semantic_trading.backtest import _is_date_resolution_mismatch
 from semantic_trading.clustering import cluster_markets
 from semantic_trading.config import (
     DATA_DIR,
+    DISCORD_SUMMARY_LLM,
     DRY_RUN,
     GAMMA_API_BASE,
+    LEADER_PRICE_CERTAINTY_THRESHOLD,
     MAX_TRADES_PER_RUN,
     PAPER_ASSUMED_BALANCE_USDC,
     PAPER_RESPECT_EXPOSURE,
@@ -61,6 +63,7 @@ from semantic_trading.notify import (
     send_summary_notification,
     send_trade_notification,
 )
+from semantic_trading.run_digest import summarize_run_digest
 from semantic_trading.types import MarketRelation, ResolvedMarket
 
 logging.basicConfig(
@@ -73,8 +76,8 @@ SIGNALS_DIR = DATA_DIR / "signals"
 SIGNALS_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _check_market_resolved(condition_id: str, slug: str = "") -> dict | None:
-    """Check if a specific market has resolved via Gamma API."""
+def _fetch_gamma_market_row(condition_id: str, slug: str = "") -> dict | None:
+    """Single Gamma /markets row for a condition or slug."""
     try:
         with httpx.Client(timeout=15.0) as client:
             for params in [
@@ -90,37 +93,54 @@ def _check_market_resolved(condition_id: str, slug: str = "") -> dict | None:
                 if not raw:
                     continue
                 data = raw[0] if isinstance(raw, list) else raw
-                if not data or not isinstance(data, dict):
-                    continue
-
-                if not data.get("closed"):
-                    return None
-
-                outcome = data.get("outcome", "")
-                if outcome:
+                if data and isinstance(data, dict):
                     return data
-
-                prices_str = data.get("outcomePrices", "")
-                try:
-                    prices = json.loads(prices_str) if isinstance(prices_str, str) else prices_str
-                except (json.JSONDecodeError, TypeError):
-                    continue
-                if prices and len(prices) == 2:
-                    p0, p1 = float(prices[0]), float(prices[1])
-                    outcomes_str = data.get("outcomes", "")
-                    try:
-                        outcomes = json.loads(outcomes_str) if isinstance(outcomes_str, str) else outcomes_str
-                    except (json.JSONDecodeError, TypeError):
-                        continue
-                    if p0 > 0.9:
-                        data["outcome"] = outcomes[0]
-                        return data
-                    if p1 > 0.9:
-                        data["outcome"] = outcomes[1]
-                        return data
-                return None
     except Exception:
         pass
+    return None
+
+
+def _outcome_from_gamma_row(data: dict, *, open_price_threshold: float) -> str | None:
+    """
+    Leader implied outcome: explicit outcome field, or extreme outcomePrices.
+    Closed markets: threshold 0.9 on prices. Open markets: open_price_threshold (stat-arb entry).
+    """
+    o = (data.get("outcome") or "").strip()
+    if o:
+        canon = _normalize_binary_outcome(o)
+        if canon:
+            return canon
+    prices_str = data.get("outcomePrices", "")
+    try:
+        prices = json.loads(prices_str) if isinstance(prices_str, str) else prices_str
+    except (json.JSONDecodeError, TypeError):
+        prices = None
+    if not prices or len(prices) != 2:
+        return None
+    try:
+        p0, p1 = float(prices[0]), float(prices[1])
+    except (ValueError, TypeError):
+        return None
+    outcomes_str = data.get("outcomes", "")
+    try:
+        outcomes = json.loads(outcomes_str) if isinstance(outcomes_str, str) else outcomes_str
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(outcomes, list) or len(outcomes) != 2:
+        return None
+    closed = bool(data.get("closed"))
+    if closed:
+        th = 0.9
+    else:
+        if open_price_threshold <= 0:
+            return None
+        th = open_price_threshold
+    if p0 >= th:
+        raw_label = outcomes[0]
+        return _normalize_binary_outcome(raw_label) or raw_label.strip()
+    if p1 >= th:
+        raw_label = outcomes[1]
+        return _normalize_binary_outcome(raw_label) or raw_label.strip()
     return None
 
 
@@ -230,6 +250,49 @@ def _resolve_market_by_question(
     return market_by_question_norm.get(best_mk)
 
 
+def _send_pipeline_summary(
+    *,
+    markets_fetched: int,
+    relations_discovered: int,
+    trades_executed: int,
+    trades_failed: int,
+    trade_records: list[dict],
+    balance_usdc: float | None,
+    total_deployed: float,
+    dry_run: bool,
+    signal_debug: dict[str, int] | None = None,
+) -> None:
+    signal_debug = dict(signal_debug or {})
+    executed = [t for t in trade_records if t.get("executed")]
+    lines = [
+        f"BUY {t['side']} ${float(t.get('bet_usdc', 0)):.2f} — {(t.get('follower') or '')[:90]}"
+        for t in executed
+    ]
+    digest: str | None = None
+    if DISCORD_SUMMARY_LLM:
+        digest = summarize_run_digest(
+            markets_fetched=markets_fetched,
+            relations_discovered=relations_discovered,
+            trades_executed=trades_executed,
+            trades_failed=trades_failed,
+            signal_debug=signal_debug,
+            executed_trades_brief=lines,
+            leader_price_entry_enabled=LEADER_PRICE_CERTAINTY_THRESHOLD > 0,
+            dry_run=dry_run,
+        )
+    send_summary_notification(
+        markets_fetched=markets_fetched,
+        relations_discovered=relations_discovered,
+        trades_executed=trades_executed,
+        trades_failed=trades_failed,
+        balance_usdc=balance_usdc,
+        total_deployed=total_deployed,
+        dry_run=dry_run,
+        run_digest=digest,
+        trades_taken_lines=lines if lines else None,
+    )
+
+
 def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
     """Run the full single-shot pipeline with dynamic position sizing."""
 
@@ -289,11 +352,16 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
             markets_scanned=len(deduped), clusters=0,
             relations_discovered=0, trades=[],
         )
-        send_summary_notification(
-            markets_fetched=len(deduped), relations_discovered=0,
-            trades_executed=0, trades_failed=0,
+        _send_pipeline_summary(
+            markets_fetched=len(deduped),
+            relations_discovered=0,
+            trades_executed=0,
+            trades_failed=0,
+            trade_records=[],
             balance_usdc=balance.balance_usdc if not dry_run else None,
+            total_deployed=0.0,
             dry_run=dry_run,
+            signal_debug={},
         )
         return
 
@@ -313,11 +381,16 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
             markets_scanned=len(deduped), clusters=len(clusters),
             relations_discovered=0, trades=[],
         )
-        send_summary_notification(
-            markets_fetched=len(deduped), relations_discovered=0,
-            trades_executed=0, trades_failed=0,
+        _send_pipeline_summary(
+            markets_fetched=len(deduped),
+            relations_discovered=0,
+            trades_executed=0,
+            trades_failed=0,
+            trade_records=[],
             balance_usdc=balance.balance_usdc if not dry_run else None,
+            total_deployed=0.0,
             dry_run=dry_run,
+            signal_debug={},
         )
         return
 
@@ -352,6 +425,7 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
     n_attempts_leader_not_resolved = 0
     n_attempts_missing_token = 0
     n_attempts_date_mismatch = 0
+    n_leader_implied_open_price = 0
 
     for rel in relations:
         if trades_remaining <= 0:
@@ -390,14 +464,20 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
             if cached_o:
                 leader_outcome = cached_o
             else:
-                resolved_data = _check_market_resolved(
-                    leader_candidate.condition_id, slug=leader_candidate.market_slug
+                gm = _fetch_gamma_market_row(
+                    leader_candidate.condition_id,
+                    leader_candidate.market_slug,
                 )
-                if not resolved_data or not resolved_data.get("outcome"):
-                    n_attempts_leader_not_resolved += 1
-                    continue
-                raw_o = resolved_data["outcome"]
-                leader_outcome = _normalize_binary_outcome(raw_o) or raw_o.strip()
+                if gm:
+                    leader_outcome = _outcome_from_gamma_row(
+                        gm,
+                        open_price_threshold=LEADER_PRICE_CERTAINTY_THRESHOLD,
+                    )
+                    if leader_outcome and not gm.get("closed"):
+                        n_leader_implied_open_price += 1
+            if not leader_outcome:
+                n_attempts_leader_not_resolved += 1
+                continue
 
             signal = _determine_signal(rel, leader_candidate, leader_outcome, follower_candidate)
 
@@ -440,8 +520,11 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
                 json.dump({**signal, "bet_size": bet_size}, f, indent=2)
 
             # Execute or paper-trade
-            execution = TradeExecution(success=False, error="Paper trade")
-            if not dry_run and bet_size > 0:
+            if dry_run:
+                execution = TradeExecution(success=False, error="Paper trade")
+            elif bet_size <= 0:
+                execution = TradeExecution(success=False, error=None)
+            else:
                 execution = execute_trade(
                     token_id=signal["token_id"],
                     amount_usdc=bet_size,
@@ -451,7 +534,6 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
                     total_deployed += bet_size
                     running_balance -= bet_size
                     trades_remaining -= 1
-                    # Track this position in exposure
                     exposure.add_position(
                         condition_id=follower_candidate.condition_id,
                         token_id=signal["token_id"],
@@ -464,22 +546,23 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
                 else:
                     trades_failed += 1
                     logger.error("Trade FAILED: %s", execution.error)
-            elif dry_run:
+
+            if dry_run:
                 trades_remaining -= 1
 
-            # Notify
-            send_trade_notification(
-                side=signal["side"],
-                follower_question=signal["follower_question"],
-                leader_question=signal["leader_question"],
-                leader_outcome=leader_outcome,
-                confidence=signal["confidence"],
-                rationale=signal["rationale"],
-                amount_usdc=bet_size if not dry_run or bet_size > 0 else None,
-                balance_after=running_balance if not dry_run else None,
-                order_id=execution.order_id,
-                error=execution.error if not execution.success and not dry_run else None,
-            )
+            if not dry_run and execution.success:
+                send_trade_notification(
+                    side=signal["side"],
+                    follower_question=signal["follower_question"],
+                    leader_question=signal["leader_question"],
+                    leader_outcome=leader_outcome,
+                    confidence=signal["confidence"],
+                    rationale=signal["rationale"],
+                    amount_usdc=bet_size,
+                    balance_after=running_balance,
+                    order_id=execution.order_id,
+                    error=None,
+                )
 
             # Record for history
             trade_records.append(record_trade(
@@ -501,15 +584,24 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
             time.sleep(1)
 
     # --- Step 4: Save history + Summary ---
+    signal_debug = {
+        "market_lookup_fail": n_relations_failed_market_lookup,
+        "date_mismatch": n_attempts_date_mismatch,
+        "follower_not_active": n_attempts_followers_not_active,
+        "leader_not_resolved": n_attempts_leader_not_resolved,
+        "missing_token": n_attempts_missing_token,
+        "leader_implied_open_price": n_leader_implied_open_price,
+    }
     logger.info(
         "Signal debug (why trades may be 0): "
         "market_lookup_fail=%d, date_mismatch=%d, follower_not_active=%d, "
-        "leader_not_resolved=%d, missing_token=%d",
+        "leader_not_resolved=%d, missing_token=%d, leader_implied_open_price=%d",
         n_relations_failed_market_lookup,
         n_attempts_date_mismatch,
         n_attempts_followers_not_active,
         n_attempts_leader_not_resolved,
         n_attempts_missing_token,
+        n_leader_implied_open_price,
     )
     save_run(
         mode="live" if not dry_run else "paper",
@@ -524,14 +616,16 @@ def run_pipeline(*, max_markets: int = 300, dry_run: bool = True) -> None:
     final_balance = running_balance if not dry_run else None
     logger.info("Pipeline complete. Executed: %d, Failed: %d, Deployed: $%.2f",
                 trades_executed, trades_failed, total_deployed)
-    send_summary_notification(
+    _send_pipeline_summary(
         markets_fetched=len(deduped),
         relations_discovered=len(relations),
         trades_executed=trades_executed,
         trades_failed=trades_failed,
+        trade_records=trade_records,
         balance_usdc=final_balance,
         total_deployed=total_deployed,
         dry_run=dry_run,
+        signal_debug=signal_debug,
     )
 
 
