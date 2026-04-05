@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import logging
+import random
+import re
+import time
 
-from openai import OpenAI
+from openai import OpenAI, RateLimitError
 
 from semantic_trading.config import CONFIDENCE_THRESHOLD, LLM_MODEL, ONLY_SAME_OUTCOME, OPENAI_API_KEY
 from semantic_trading.types import MarketRelation, MarketRelationList, ResolvedMarket
 
 logger = logging.getLogger(__name__)
+
+MAX_RATE_LIMIT_RETRIES = 6
+BASE_BACKOFF_SECONDS = 1.0
+MAX_BACKOFF_SECONDS = 30.0
+RETRY_DELAY_HINT_RE = re.compile(r"try again in ([0-9.]+)\s*(ms|s)", re.IGNORECASE)
 
 SYSTEM_PROMPT = """\
 You are an expert prediction-market analyst. Given a list of bets expressed as questions, \
@@ -64,16 +72,43 @@ def discover_relations(
     context = f"Cluster category: {category}\n\n" if category else ""
     user_msg = f"{context}Market questions:\n{questions_text}"
 
-    client = OpenAI(api_key=OPENAI_API_KEY)
-    resp = client.beta.chat.completions.parse(
-        model=LLM_MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_msg},
-        ],
-        response_format=MarketRelationList,
-        temperature=0.0,
-    )
+    client = OpenAI(api_key=OPENAI_API_KEY, max_retries=0)
+    resp = None
+    for attempt in range(1, MAX_RATE_LIMIT_RETRIES + 1):
+        try:
+            resp = client.beta.chat.completions.parse(
+                model=LLM_MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg},
+                ],
+                response_format=MarketRelationList,
+                temperature=0.0,
+            )
+            break
+        except RateLimitError as e:
+            if attempt >= MAX_RATE_LIMIT_RETRIES:
+                logger.error(
+                    "Rate limit persisted after %d attempts for cluster '%s' (%d markets); skipping cluster",
+                    MAX_RATE_LIMIT_RETRIES,
+                    category or "unlabeled",
+                    len(markets),
+                )
+                return []
+
+            retry_delay = _compute_retry_delay_seconds(e, attempt)
+            logger.warning(
+                "Rate limited discovering cluster '%s' (%d markets), retry %d/%d in %.2fs",
+                category or "unlabeled",
+                len(markets),
+                attempt,
+                MAX_RATE_LIMIT_RETRIES,
+                retry_delay,
+            )
+            time.sleep(retry_delay)
+
+    if resp is None:
+        return []
 
     result = resp.choices[0].message.parsed
     if result is None:
@@ -92,6 +127,18 @@ def discover_relations(
         len(result.relations), len(filtered), len(markets),
     )
     return filtered
+
+
+def _compute_retry_delay_seconds(error: RateLimitError, attempt: int) -> float:
+    """Exponential backoff with optional delay hint from OpenAI error text."""
+    backoff = min(MAX_BACKOFF_SECONDS, BASE_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+    match = RETRY_DELAY_HINT_RE.search(str(error))
+    if match:
+        value = float(match.group(1))
+        unit = match.group(2).lower()
+        hinted = value / 1000.0 if unit == "ms" else value
+        backoff = max(backoff, hinted)
+    return backoff + random.uniform(0.0, 0.5)
 
 
 SKIP_CATEGORIES = {"sports"}
